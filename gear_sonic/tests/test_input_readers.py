@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import numpy as np
 
-from gear_sonic.utils.teleop.input_readers import _body_data_to_24x7
+from gear_sonic.utils.teleop.input_readers import IsaacTeleopReader, _body_data_to_24x7
 
 
 class MockBodyJoints:
@@ -87,3 +87,9 @@ def test_body_data_to_24x7_keeps_ros2_bridge_dictionary_compatibility():
         np.array([0.4, 0.5, 0.6, 0.0, 0.0, 1.0, 0.0], dtype=np.float32),
     )
     np.testing.assert_array_equal(result[2:], np.zeros((22, 7), dtype=np.float32))
+
+
+def test_isaac_teleop_revo2_triggers_fail_closed_without_source_timestamps():
+    reader = object.__new__(IsaacTeleopReader)
+
+    assert reader.get_revo2_trigger_sample() is None

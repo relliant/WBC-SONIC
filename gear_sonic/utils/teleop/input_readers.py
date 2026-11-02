@@ -404,6 +404,10 @@ class IsaacTeleopReader:
         with self._ctrl_lock:
             return self._latest_controller
 
+    def get_revo2_trigger_sample(self) -> tuple[int, float, float, int] | None:
+        """Fail closed because DeviceIO 1.4 omits controller sample timestamps."""
+        return None
+
     @property
     def disconnected(self) -> bool:
         return self._disconnected.is_set()
@@ -442,6 +446,7 @@ class IsaacTeleopReader:
                 time.sleep(self._period)
                 continue
 
+            stamp_ns = int(self._client.get_timestamp_ns())
             controller = _build_controller_dict(raw)
             if controller is not None:
                 with self._ctrl_lock:
@@ -456,7 +461,6 @@ class IsaacTeleopReader:
                 time.sleep(self._period)
                 continue
 
-            stamp_ns = int(self._client.get_timestamp_ns())
             prev_stamp_ns = self._last_stamp_ns
             device_dt = ((stamp_ns - prev_stamp_ns) * 1e-9) if prev_stamp_ns is not None else 0.0
             if device_dt > 0.0:

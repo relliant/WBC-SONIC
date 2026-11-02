@@ -97,6 +97,7 @@ Documentation
    tutorials/zmq
    tutorials/manager
    tutorials/isaac_teleop_publisher_setup
+   tutorials/revo2_pico_teleop
    tutorials/vr_wholebody_teleop
    tutorials/live_camera_teleop
    tutorials/data_collection

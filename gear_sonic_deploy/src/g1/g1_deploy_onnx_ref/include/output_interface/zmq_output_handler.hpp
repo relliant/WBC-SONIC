@@ -4,10 +4,11 @@
  *
  * Publishes two topic-prefixed streams over a single ZMQ PUB socket:
  *
- *   Topic Prefix    | Frequency       | Description
- *   ----------------|-----------------|-------------------------------------------
- *   {user_topic}    | Every tick      | Combined state + visualisation (msgpack).
- *   robot_config    | Every ~2 s      | Robot configuration (msgpack, always re-published).
+ *   Topic Prefix          | Frequency       | Description
+ *   ----------------------|-----------------|-------------------------------------------
+ *   {user_topic}          | Every tick      | Combined state + visualisation (msgpack).
+ *   sonic_control_status  | Every tick      | SONIC control permission and hand mode.
+ *   robot_config          | Every ~2 s      | Robot configuration (msgpack, always re-published).
  *
  * Wire format (single-part ZMQ message):
  *
@@ -131,7 +132,7 @@ public:
      */
     explicit ZMQOutputHandler(StateLogger& logger, int port, const std::string& topic) 
         : OutputInterface(logger), realtime_debug_context_(1), topic_(topic),
-          robot_config_topic_("robot_config") {
+          control_status_topic_("sonic_control_status"), robot_config_topic_("robot_config") {
 
         std::cout << "Initializing realtime debug socket" << std::endl;
         std::cout << "Binding to port: " << port << " and topic: " << topic_ << std::endl;
@@ -147,6 +148,7 @@ public:
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[ZMQ Output DEBUG] ZMQOutputHandler initialized with topics: "
                       << "'" << topic_ << "' (combined state+viz), "
+                      << "'" << control_status_topic_ << "' (control status), "
                       << "'" << robot_config_topic_ << "' (config)" << std::endl;
         }
         
@@ -229,12 +231,40 @@ public:
         }
     }
 
+    void publish_control_status(bool control_enabled,
+                                bool operator_stop,
+                                uint64_t sequence,
+                                const std::string& hand_mode) override {
+        msgpack::sbuffer status;
+        msgpack::packer<msgpack::sbuffer> pk(&status);
+        pk.pack_map(5);
+        pk.pack("schema");
+        pk.pack("sonic.control_status.v1");
+        pk.pack("sequence");
+        pk.pack(sequence);
+        pk.pack("control_enabled");
+        pk.pack(control_enabled);
+        pk.pack("operator_stop");
+        pk.pack(operator_stop);
+        pk.pack("hand_mode");
+        pk.pack(hand_mode);
+        try {
+            send_zmq_message(control_status_topic_, status);
+        } catch (const zmq::error_t& error) {
+            if constexpr (DEBUG_LOGGING) {
+                std::cerr << "[ZMQ Output DEBUG] Control status send failed: "
+                          << error.what() << std::endl;
+            }
+        }
+    }
+
 private:
     zmq::context_t realtime_debug_context_;                ///< ZMQ context (1 I/O thread).
     std::unique_ptr<zmq::socket_t> realtime_debug_socket_; ///< ZMQ PUB socket.
 
-    std::string topic_;              ///< User-provided topic name (e.g. "g1_debug") for combined state+viz.
-    std::string robot_config_topic_; ///< Topic for robot config messages.
+    std::string topic_;                ///< User-provided topic name for combined state+viz.
+    std::string control_status_topic_; ///< Non-blocking SONIC control-permission heartbeat.
+    std::string robot_config_topic_;   ///< Topic for robot config messages.
 
     msgpack::sbuffer state_data_sbuf_;  ///< Reused each tick; cleared in pack_combined_state().
 

@@ -39,6 +39,8 @@
 
 #include <memory>
 #include <array>
+#include <cstdint>
+#include <string>
 #include <vector>
 #include <msgpack.hpp>
 
@@ -106,6 +108,9 @@ public:
      * transient_local QoS).  The default implementation is a no-op.
      */
     virtual void publish_config() {}
+
+    /** Publish a non-blocking control-permission heartbeat when supported. */
+    virtual void publish_control_status(bool, bool, uint64_t, const std::string&) {}
 
 protected:
 

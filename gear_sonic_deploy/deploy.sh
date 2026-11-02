@@ -209,7 +209,8 @@ show_usage() {
     echo "  --planner PATH          Set the planner model path (default: planner/example.onnx)"
     echo "  --motion-data PATH      Set the motion data path (default: reference/example_motion/)"
     echo "  --input-type TYPE       Set the input type (default: zmq_manager)"
-    echo "  --output-type TYPE      Set the output type (default: ros2)"
+    echo "  --output-type TYPE      Set the output type (default: all)"
+    echo "  --hand-mode MODE        Set hand control mode: dex3 or external (default: dex3)"
     echo "  --zmq-host HOST         Set the ZMQ host (default: localhost)"
     echo "  --motor-kp-scale SPEC   Scale Kp for hardware motor indices/ranges"
     echo "  --motor-kd-scale SPEC   Scale Kd for hardware motor indices/ranges"
@@ -237,12 +238,13 @@ show_usage() {
 INTERFACE_MODE="real"
 
 # Default configuration values (can be overridden by command line)
-CHECKPOINT_DEFAULT="policy/release/model"
-OBS_CONFIG_DEFAULT="policy/release/observation_config.yaml"
+CHECKPOINT_DEFAULT="policy/sonic_v1_1/model"
+OBS_CONFIG_DEFAULT="policy/sonic_v1_1/observation_config.yaml"
 PLANNER_DEFAULT="planner/target_vel/V2/planner_sonic.onnx"
 MOTION_DATA_DEFAULT="reference/example/"
 INPUT_TYPE_DEFAULT="manager"
 OUTPUT_TYPE_DEFAULT="all"
+HAND_MODE_DEFAULT="dex3"
 ZMQ_HOST_DEFAULT="localhost"
 
 # Initialize with defaults (will be set after parsing)
@@ -252,6 +254,7 @@ PLANNER="$PLANNER_DEFAULT"
 MOTION_DATA="$MOTION_DATA_DEFAULT"
 INPUT_TYPE="$INPUT_TYPE_DEFAULT"
 OUTPUT_TYPE="$OUTPUT_TYPE_DEFAULT"
+HAND_MODE="$HAND_MODE_DEFAULT"
 ZMQ_HOST="$ZMQ_HOST_DEFAULT"
 MOTOR_KP_SCALES=()
 MOTOR_KD_SCALES=()
@@ -311,6 +314,14 @@ while [[ $# -gt 0 ]]; do
             OUTPUT_TYPE="$2"
             shift 2
             ;;
+        --hand-mode)
+            if [[ $# -lt 2 ]] || [[ "$2" != "dex3" && "$2" != "external" ]]; then
+                echo -e "${RED}Error: --hand-mode must be 'dex3' or 'external'${NC}" >&2
+                exit 1
+            fi
+            HAND_MODE="$2"
+            shift 2
+            ;;
         --zmq-host)
             if [[ -z "$2" ]]; then
                 echo -e "${RED}Error: --zmq-host requires a host argument${NC}" >&2
@@ -346,6 +357,11 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+if [[ "$HAND_MODE" == "external" && "$OUTPUT_TYPE" != "zmq" && "$OUTPUT_TYPE" != "all" ]]; then
+    echo -e "${RED}Error: --hand-mode external requires --output-type zmq or all${NC}" >&2
+    exit 1
+fi
 
 # ============================================================================
 # Display Header
@@ -540,6 +556,7 @@ echo -e "  Obs Config:         ${GREEN}$OBS_CONFIG${NC}"
 echo -e "  Planner:            ${GREEN}$PLANNER${NC}"
 echo -e "  Input Type:         ${GREEN}$INPUT_TYPE${NC}"
 echo -e "  Output Type:        ${GREEN}$OUTPUT_TYPE${NC}"
+echo -e "  Hand Mode:          ${GREEN}$HAND_MODE${NC}"
 echo -e "  ZMQ Host:           ${GREEN}$ZMQ_HOST${NC}"
 if (( ${#EXTRA_ARGS[@]} > 0 )); then
 printf -v EXTRA_ARGS_DISPLAY ' %q' "${EXTRA_ARGS[@]}"
@@ -556,6 +573,7 @@ echo -e "${BLUE}    --encoder-file $CHECKPOINT_ENCODER \\${NC}"
 echo -e "${BLUE}    --planner-file $PLANNER \\${NC}"
 echo -e "${BLUE}    --input-type $INPUT_TYPE \\${NC}"
 echo -e "${BLUE}    --output-type $OUTPUT_TYPE \\${NC}"
+echo -e "${BLUE}    --hand-mode $HAND_MODE \\${NC}"
 echo -e "${BLUE}    --zmq-host $ZMQ_HOST${NC}"
 if (( ${#EXTRA_ARGS[@]} > 0 )); then
 echo -e "${BLUE}    ${EXTRA_ARGS_DISPLAY# }${NC}"
@@ -584,6 +602,7 @@ if [[ "$confirm" =~ ^[Yy]$ ]] || [[ -z "$confirm" ]]; then
         --planner-file "$PLANNER" \
         --input-type "$INPUT_TYPE" \
         --output-type "$OUTPUT_TYPE" \
+        --hand-mode "$HAND_MODE" \
         --zmq-host "$ZMQ_HOST" \
         "${EXTRA_ARGS[@]}"
 else

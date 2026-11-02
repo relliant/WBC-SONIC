@@ -282,6 +282,7 @@ class G1Deploy {
     std::unique_ptr<unitree::robot::b2::MotionSwitcherClient> msc_;
     
     // Dex3 hands manager
+    bool dex3_enabled_ = true;
     Dex3Hands dex3_hands_;
 
     // Motor error monitor (tracks fault state transitions)
@@ -298,6 +299,7 @@ class G1Deploy {
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{500};
     ProgramState program_state_;
+    uint64_t control_status_sequence_ = 0;
     MotorGainScaleConfig motor_gain_scales_;
     std::array<double, G1_NUM_MOTOR> last_action;
     std::array<double, 7> last_left_hand_action;
@@ -2146,6 +2148,16 @@ class G1Deploy {
       return false;
     }
 
+    void PublishControlStatus(bool control_enabled, bool operator_stop) {
+      const std::string hand_mode = dex3_enabled_ ? "dex3" : "external";
+      const uint64_t sequence = control_status_sequence_++;
+      for (auto& output_interface : output_interfaces_) {
+        if (output_interface) {
+          output_interface->publish_control_status(
+              control_enabled, operator_stop, sequence, hand_mode);
+        }
+      }
+    }
 
 
   public:
@@ -2180,7 +2192,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      MotorGainScaleConfig motor_gain_scales = {})
+      MotorGainScaleConfig motor_gain_scales = {},
+      bool dex3_enabled = true)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2191,6 +2204,7 @@ class G1Deploy {
         mode_pr_(Mode::PR),
         mode_machine_(0),
         disable_crc_check_(disable_crc_check),
+        dex3_enabled_(dex3_enabled),
         program_state_(ProgramState::INIT),
         motor_gain_scales_(motor_gain_scales),
         last_action {0.0},
@@ -2218,7 +2232,9 @@ class G1Deploy {
       ChannelFactory::Instance()->Init(0, networkInterface);
 
       // Initialize Dex3 hands (ChannelFactory already initialized above)
-      dex3_hands_.initialize("");
+      if (dex3_enabled_) {
+        dex3_hands_.initialize("");
+      }
 
       audio_thread_ = std::make_unique<AudioThread>();
 
@@ -2551,7 +2567,9 @@ class G1Deploy {
         input_interface_->SetVR3PointCompliance(initial_vr_3point_compliance_);
         // Set initial max close ratio for hands (keyboard-controlled: X/C keys)
         input_interface_->SetMaxCloseRatio(initial_max_close_ratio_);
-        dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        if (dex3_enabled_) {
+          dex3_hands_.SetMaxCloseRatio(initial_max_close_ratio_);
+        }
         std::cout << "[INFO] Initial VR 3-point compliance: ["
                   << initial_vr_3point_compliance_[0] << ", "
                   << initial_vr_3point_compliance_[1] << ", "
@@ -2712,7 +2730,9 @@ class G1Deploy {
       }
 
       // Publish Dex3 hand commands at the same publish cadence
-      dex3_hands_.writeOnce();
+      if (dex3_enabled_) {
+        dex3_hands_.writeOnce();
+      }
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -2731,6 +2751,7 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
+      PublishControlStatus(false, true);
       CreateDampingCommand();
       LowCommandWriter();
       std::cout << "Stop" << std::endl;
@@ -2781,12 +2802,16 @@ class G1Deploy {
           motor_command_tmp.q_target.at(i) =
               static_cast<float>(current_pos * (1.0 - ratio) + default_angles[i] * ratio);
         }
-        dex3_hands_.close(true);
-        dex3_hands_.close(false);
+        if (dex3_enabled_) {
+          dex3_hands_.close(true);
+          dex3_hands_.close(false);
+        }
       } else {
         program_state_ = ProgramState::WAIT_FOR_CONTROL;
-        dex3_hands_.open(true);
-        dex3_hands_.open(false);
+        if (dex3_enabled_) {
+          dex3_hands_.open(true);
+          dex3_hands_.open(false);
+        }
         std::cout << "Init Done" << std::endl;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
@@ -2939,19 +2964,21 @@ class G1Deploy {
       std::array<double, 7> right_hand_q = {0.0};
       std::array<double, 7> right_hand_dq = {0.0};
       
-      auto left_hand_state_ptr = dex3_hands_.getState(true);
-      if (left_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
-          left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+      if (dex3_enabled_) {
+        auto left_hand_state_ptr = dex3_hands_.getState(true);
+        if (left_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            left_hand_q[i] = left_hand_state_ptr->motor_state()[i].q();
+            left_hand_dq[i] = left_hand_state_ptr->motor_state()[i].dq();
+          }
         }
-      }
-      
-      auto right_hand_state_ptr = dex3_hands_.getState(false);
-      if (right_hand_state_ptr) {
-        for (int i = 0; i < 7; ++i) {
-          right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
-          right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+
+        auto right_hand_state_ptr = dex3_hands_.getState(false);
+        if (right_hand_state_ptr) {
+          for (int i = 0; i < 7; ++i) {
+            right_hand_q[i] = right_hand_state_ptr->motor_state()[i].q();
+            right_hand_dq[i] = right_hand_state_ptr->motor_state()[i].dq();
+          }
         }
       }
 
@@ -3832,7 +3859,10 @@ class G1Deploy {
      *    10. Periodic timing log every 50 ticks (~1 s).
      */
     void Control() {
-      if (operator_state.stop) { return; }
+      if (operator_state.stop) {
+        PublishControlStatus(false, true);
+        return;
+      }
 
       switch (program_state_) {
         case ProgramState::INIT:
@@ -3843,12 +3873,14 @@ class G1Deploy {
           // Re-publish robot_config so late-joining subscribers can receive it
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
+          PublishControlStatus(false, false);
           break;
 
         case ProgramState::WAIT_FOR_CONTROL:
           if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, cannot start control." << std::endl;
             operator_state.stop = true;
+            PublishControlStatus(false, true);
             break;
           }
 
@@ -3868,12 +3900,14 @@ class G1Deploy {
             std::cout << "[Control] DEBUG: operator_state.start=true, transitioning to CONTROL state" << std::endl;
             program_state_ = ProgramState::CONTROL;
           }
+          PublishControlStatus(false, false);
           break;
 
         case ProgramState::CONTROL: {
           if (!CheckSafety()) {
             std::cout << "[ERROR] Safety check failed, stopping control." << std::endl;
             operator_state.stop = true;
+            PublishControlStatus(false, true);
             break;
           }
 
@@ -3885,6 +3919,7 @@ class G1Deploy {
           if (!GatherRobotStateToLogger()) {
             std::cout << "✗ Error: Failed to gather robot state to logger in the middle of the control loop!" << std::endl;
             operator_state.stop = true;
+            PublishControlStatus(false, true);
             std::cout << "Stopping control system." << std::endl;
             return;
           }
@@ -3931,6 +3966,7 @@ class G1Deploy {
           }
 
           if (!GatherInputInterfaceData()) {
+            PublishControlStatus(false, false);
             return;
           }
 
@@ -3961,6 +3997,7 @@ class G1Deploy {
               std::cout << "✗ Error: Failed to gather observations in the middle of the control loop!" << std::endl;
               std::cout << "Stopping control system." << std::endl;
               operator_state.stop = true;
+              PublishControlStatus(false, true);
               return;
             }
           } // Release lock after all observation-dependent operations
@@ -3980,21 +4017,24 @@ class G1Deploy {
             std::cout << "✗ Error: Failed to create policy command in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
             operator_state.stop = true;
+            PublishControlStatus(false, true);
             return;
           }
           auto motor_command_end_time = std::chrono::steady_clock::now();
 
-          // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
-          dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
-          
-          // set hand poses (use buffered data for consistency)
-          dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
-          dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
-          
-          // Update last hand actions for logging (use buffered data)
-          for (int i = 0; i < 7; ++i) {
-            last_left_hand_action[i] = left_hand_joint_buffer_[i];
-            last_right_hand_action[i] = right_hand_joint_buffer_[i];
+          if (dex3_enabled_) {
+            // Update Dex3 hands max close ratio from keyboard-controlled value (X/C keys)
+            dex3_hands_.SetMaxCloseRatio(input_interface_->GetMaxCloseRatio());
+
+            // set hand poses (use buffered data for consistency)
+            dex3_hands_.setAllJointsCommand(true, left_hand_joint_buffer_);
+            dex3_hands_.setAllJointsCommand(false, right_hand_joint_buffer_);
+
+            // Update last hand actions for logging (use buffered data)
+            for (int i = 0; i < 7; ++i) {
+              last_left_hand_action[i] = left_hand_joint_buffer_[i];
+              last_right_hand_action[i] = right_hand_joint_buffer_[i];
+            }
           }
           
           auto hand_joint_end_time = std::chrono::steady_clock::now();
@@ -4070,8 +4110,15 @@ class G1Deploy {
             std::cout << "✗ Error: Failed to advance current frame in the middle of the control loop!" << std::endl;
             std::cout << "Stopping control system." << std::endl;
             operator_state.stop = true;
+            PublishControlStatus(false, true);
             return;
           }
+
+          if (operator_state.stop) {
+            PublishControlStatus(false, true);
+            return;
+          }
+          PublishControlStatus(true, false);
 
           if (logging_counter_ % 50 == 0) {
             auto control_loop_end_time = std::chrono::steady_clock::now();
@@ -4106,7 +4153,9 @@ class G1Deploy {
             }
             
             // Print hand max close ratio (keyboard-controlled via X/C keys)
-            std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            if (dex3_enabled_) {
+              std::cout << " | HandCloseRatio: " << dex3_hands_.GetMaxCloseRatio();
+            }
             
             std::cout << std::endl;
           }
@@ -4187,6 +4236,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
     std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
     std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
+    std::cout << "  --hand-mode <dex3|external>: select hand control mode (default: dex3)" << std::endl;
     std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
     std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
     std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
@@ -4233,6 +4283,7 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  std::string hand_mode = "dex3";
   MotorGainScaleConfig motor_gain_scales;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -4453,6 +4504,17 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --set-compliance requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--hand-mode") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --hand-mode requires dex3 or external" << std::endl;
+        exit(1);
+      }
+      hand_mode = argv[++i];
+      if (hand_mode != "dex3" && hand_mode != "external") {
+        std::cerr << "Error: --hand-mode must be 'dex3' or 'external'" << std::endl;
+        exit(1);
+      }
+      std::cout << "[INFO] Hand mode: " << hand_mode << std::endl;
     } else if (std::string(argv[i]) == "--max-close-ratio") {
       if (i + 1 < argc) {
         try {
@@ -4474,6 +4536,12 @@ int main(int argc, char const* argv[]) {
         exit(1);
       }
     }
+  }
+
+  if (hand_mode == "external" && outputType != "zmq" && outputType != "all") {
+    std::cerr << "Error: --hand-mode external requires --output-type zmq or all "
+              << "for the control-status interlock" << std::endl;
+    return 1;
   }
 
   std::cout << "[DEBUG] Creating G1Deploy object..." << std::endl;
@@ -4506,7 +4574,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    motor_gain_scales
+    motor_gain_scales,
+    hand_mode == "dex3"
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

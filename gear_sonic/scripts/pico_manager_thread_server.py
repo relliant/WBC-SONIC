@@ -36,6 +36,13 @@ import torch
 import zmq
 
 from gear_sonic.utils.teleop import input_readers
+from gear_sonic.utils.teleop.revo2_hand_sender import (
+    Revo2HandSender,
+    Revo2PoseProfile,
+    Revo2TeleopError,
+    SonicControlGate,
+    require_fresh_trigger_source,
+)
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
 from gear_sonic.trl.utils.rotation_conversion import decompose_rotation_aa
 from gear_sonic.trl.utils.torch_transform import (
@@ -810,6 +817,7 @@ class PicoReader:
         self._fps_ema = 0.0
         self._last_stamp_ns = None
         self._latest = None
+        self._latest_revo2_trigger_sample: tuple[int, float, float, int] | None = None
         self._lock = threading.Lock()
 
     def start(self):
@@ -831,9 +839,15 @@ class PicoReader:
         pass
 
     def get_timestamp_ns(self) -> int:
-        if xrt is None:
-            return 0
-        return int(xrt.get_time_stamp_ns())
+        with self._lock:
+            if self._latest is None:
+                return 0
+            return int(self._latest["timestamp_ns"])
+
+    def get_revo2_trigger_sample(self) -> tuple[int, float, float, int] | None:
+        """Return triggers sampled with one fresh XRT body frame."""
+        with self._lock:
+            return self._latest_revo2_trigger_sample
 
     def _run(self):
         last_report = time.time()
@@ -856,6 +870,15 @@ class PicoReader:
             t_monotonic = time.monotonic()
             try:
                 body_poses = xrt.get_body_joints_pose()
+                try:
+                    revo2_trigger_sample = (
+                        int(stamp_ns),
+                        float(xrt.get_left_trigger()),
+                        float(xrt.get_right_trigger()),
+                        time.monotonic_ns(),
+                    )
+                except Exception:
+                    revo2_trigger_sample = None
 
                 sample = {
                     "body_poses_np": np.array(body_poses),
@@ -866,6 +889,8 @@ class PicoReader:
                     "fps": self._fps_ema,
                 }
                 with self._lock:
+                    if revo2_trigger_sample is not None:
+                        self._latest_revo2_trigger_sample = revo2_trigger_sample
                     self._latest = sample
                 now = time.time()
                 if now - last_report >= 5.0:
@@ -1651,6 +1676,11 @@ class FeedbackReader:
 
     def __init__(self, zmq_feedback_host: str = "localhost", zmq_feedback_port: int = 5557):
         self.poller = ZMQPoller(host=zmq_feedback_host, port=zmq_feedback_port, topic="g1_debug")
+        self.control_poller = ZMQPoller(
+            host=zmq_feedback_host,
+            port=zmq_feedback_port,
+            topic="sonic_control_status",
+        )
 
         self.upper_body_joint_indices = self._get_upper_body_joint_indices()
 
@@ -1660,6 +1690,7 @@ class FeedbackReader:
         # Full body joint configuration (29 DOFs) as measured from robot,
         # used for FK when recalibrating VR 3PT tracking against actual robot pose
         self.full_body_q_measured: np.ndarray | None = None
+        self.control_gate = SonicControlGate(timeout_ms=150)
 
     def _get_upper_body_joint_indices(self) -> list[int]:
         # TODO: get from robot model, not hardcoded
@@ -1676,6 +1707,18 @@ class FeedbackReader:
             self.full_body_q_measured,
         ) = self._process_upper_body_position_targets()
         print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
+
+    def poll_control_permission(self) -> bool:
+        """Return true only for a fresh, explicit C++ external-hand heartbeat."""
+        now_ns = time.monotonic_ns()
+        data = self.control_poller.get_data()
+        if data is not None:
+            try:
+                unpacked = msgpack.unpackb(data, raw=False, strict_map_key=True)
+            except (msgpack.ExtraData, msgpack.FormatError, msgpack.StackError, ValueError):
+                unpacked = None
+            self.control_gate.accept(unpacked, received_ns=now_ns)
+        return self.control_gate.permitted(now_ns=now_ns)
 
     def _process_upper_body_position_targets(
         self,
@@ -1897,6 +1940,48 @@ class PlannerStreamer:
         self.last_send = time.time()
 
 
+def _start_revo2_hand_sender(
+    *,
+    profile_path: str | None,
+    command_bind: str | None,
+    feedback_connect: str | None,
+    controller_id: str | None,
+    permit_actuation: bool,
+) -> Revo2HandSender | None:
+    config = {
+        "profile": profile_path,
+        "command bind endpoint": command_bind,
+        "feedback connect endpoint": feedback_connect,
+        "controller ID": controller_id,
+    }
+    configured = [value is not None for value in config.values()]
+    if not any(configured) and not permit_actuation:
+        return None
+    if not permit_actuation:
+        raise Revo2TeleopError(
+            "Revo2 options were provided without --permit-revo2-actuation"
+        )
+    missing = [name for name, value in config.items() if value is None]
+    if missing:
+        raise Revo2TeleopError(
+            "Revo2 actuation requires explicit " + ", ".join(missing)
+        )
+    assert profile_path is not None
+    assert command_bind is not None
+    assert feedback_connect is not None
+    assert controller_id is not None
+
+    profile = Revo2PoseProfile.from_json(profile_path)
+    sender = Revo2HandSender(
+        command_bind,
+        feedback_connect,
+        controller_id=controller_id,
+        profile=profile,
+        permit_actuation=True,
+    )
+    return sender.start()
+
+
 def run_pico_manager(
     port: int = 5556,
     buffer_size: int = 15,
@@ -1912,6 +1997,11 @@ def run_pico_manager(
     enable_waist_tracking: bool = False,
     enable_smpl_vis: bool = False,
     input_source: str = "xrt",
+    revo2_profile: str | None = None,
+    revo2_command_bind: str | None = None,
+    revo2_feedback_connect: str | None = None,
+    revo2_controller_id: str | None = None,
+    permit_revo2_actuation: bool = False,
 ):
     """
     Manager: creates shared PUB socket and runs pose/planner streamers based on current mode.
@@ -1919,6 +2009,18 @@ def run_pico_manager(
       A+X: Toggle between planner and pose mode
       A+B+X+Y: Toggle policy start/stop
     """
+    revo2_requested = any(
+        (
+            revo2_profile,
+            revo2_command_bind,
+            revo2_feedback_connect,
+            revo2_controller_id,
+            permit_revo2_actuation,
+        )
+    )
+    if revo2_requested:
+        require_fresh_trigger_source(input_source)
+
     reader = _init_input_source(input_source, buffer_size)
 
     context = zmq.Context()
@@ -1963,6 +2065,24 @@ def run_pico_manager(
         zmq_feedback_port=zmq_feedback_port,
     )
 
+    try:
+        revo2_sender = _start_revo2_hand_sender(
+            profile_path=revo2_profile,
+            command_bind=revo2_command_bind,
+            feedback_connect=revo2_feedback_connect,
+            controller_id=revo2_controller_id,
+            permit_actuation=permit_revo2_actuation,
+        )
+    except BaseException:
+        reader.stop()
+        three_point.close()
+        socket.close()
+        context.term()
+        raise
+    if revo2_sender is not None:
+        print("[Manager] Revo2 whole-hand trigger control enabled")
+    revo2_faulted = False
+
     # State machine diagram:
     #
     #   Chain 1 (by_pressed enters/exits, left_axis_click toggles sub-mode):
@@ -1994,7 +2114,14 @@ def run_pico_manager(
             # Poll Pico controller for buttons/axes
             a_pressed, b_pressed, x_pressed, y_pressed = get_abxy_buttons(reader)
 
-            left_menu_button, _, _, left_grip_mgr, _ = get_controller_inputs(reader)
+            (
+                left_menu_button,
+                _left_trigger,
+                _right_trigger,
+                left_grip_mgr,
+                _,
+            ) = get_controller_inputs(reader)
+            revo2_trigger_sample = reader.get_revo2_trigger_sample()
 
             left_axis_click, _ = get_axis_clicks(reader)
 
@@ -2106,11 +2233,62 @@ def run_pico_manager(
             ):
                 planner_streamer.run_once(new_mode)
 
+            if revo2_sender is not None and not revo2_faulted:
+                now_ns = time.monotonic_ns()
+                trigger_sample_stale = (
+                    revo2_trigger_sample is not None
+                    and (
+                        now_ns < revo2_trigger_sample[3]
+                        or now_ns - revo2_trigger_sample[3] > 150_000_000
+                    )
+                )
+                if trigger_sample_stale:
+                    revo2_sender.stop()
+                    revo2_faulted = True
+                    print(
+                        "[Manager] Revo2 hand control faulted and stopped: "
+                        "PICO trigger input exceeded the 150 ms freshness limit"
+                    )
+                else:
+                    body_control_permitted = (
+                        planner_streamer.feedback_reader.poll_control_permission()
+                    )
+                    hands_enabled = (
+                        revo2_trigger_sample is not None
+                        and new_mode not in (StreamMode.OFF, StreamMode.POSE_PAUSE)
+                        and body_control_permitted
+                    )
+                    if revo2_trigger_sample is None:
+                        hand_timestamp_ns = 0
+                        hand_left_trigger = 0.0
+                        hand_right_trigger = 0.0
+                    else:
+                        (
+                            hand_timestamp_ns,
+                            hand_left_trigger,
+                            hand_right_trigger,
+                            _,
+                        ) = revo2_trigger_sample
+                    try:
+                        revo2_sender.update(
+                            source_timestamp_ns=int(hand_timestamp_ns),
+                            left_trigger=float(hand_left_trigger),
+                            right_trigger=float(hand_right_trigger),
+                            enabled=hands_enabled,
+                        )
+                    except Exception as error:
+                        # Keep a hand transport/protocol failure isolated from the
+                        # body control loop. KeyboardInterrupt/SystemExit still pass.
+                        revo2_faulted = True
+                        revo2_sender.stop()
+                        print(f"[Manager] Revo2 hand control faulted and stopped: {error}")
+
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
+            should_exit = False
             if new_mode != current_mode:
                 if new_mode == StreamMode.OFF:
                     socket.send(build_command_message(start=False, stop=True, planner=True))
-                    exit()
+                    should_exit = True
                 elif (
                     new_mode == StreamMode.PLANNER
                     or new_mode == StreamMode.PLANNER_FROZEN_UPPER_BODY
@@ -2122,6 +2300,9 @@ def run_pico_manager(
 
                 print(f"[Manager] StreamMode switch: {current_mode.name} -> {new_mode.name}")
                 current_mode = new_mode
+
+            if should_exit:
+                break
 
             # Mode-independent: send manager_state for data exporter
             toggle_dc_tmp = bool(a_pressed) and left_grip_mgr > 0.5
@@ -2149,7 +2330,9 @@ def run_pico_manager(
     except KeyboardInterrupt:
         print("\nStopping manager...")
     finally:
-        # Cleanup resources
+        # Stop the hand lease before tearing down the body input and sockets.
+        if revo2_sender is not None:
+            revo2_sender.close()
         reader.stop()
         three_point.close()
         socket.close()
@@ -2251,6 +2434,27 @@ if __name__ == "__main__":
             "'isaac-teleop' for in-process IsaacTeleop / CloudXR DeviceIO"
         ),
     )
+    parser.add_argument(
+        "--revo2-profile",
+        help="Validated revo2.pico_pose_profile.v1 JSON file (manager mode only)",
+    )
+    parser.add_argument(
+        "--revo2-command-bind",
+        help="Explicit tcp:// endpoint to bind for Revo2 v3 commands",
+    )
+    parser.add_argument(
+        "--revo2-feedback-connect",
+        help="Explicit tcp:// Revo2 physical-agent feedback endpoint",
+    )
+    parser.add_argument(
+        "--revo2-controller-id",
+        help="Controller identity configured in the Revo2 physical-agent launcher",
+    )
+    parser.add_argument(
+        "--permit-revo2-actuation",
+        action="store_true",
+        help="Explicitly allow manager mode to publish Revo2 hand commands",
+    )
     args = parser.parse_args()
 
     # Standalone VR3Pt test modes (exit after finishing)
@@ -2292,8 +2496,23 @@ if __name__ == "__main__":
             enable_waist_tracking=args.waist_tracking,
             enable_smpl_vis=args.vis_smpl,
             input_source=args.input_source,
+            revo2_profile=args.revo2_profile,
+            revo2_command_bind=args.revo2_command_bind,
+            revo2_feedback_connect=args.revo2_feedback_connect,
+            revo2_controller_id=args.revo2_controller_id,
+            permit_revo2_actuation=args.permit_revo2_actuation,
         )
     else:
+        if any(
+            (
+                args.revo2_profile,
+                args.revo2_command_bind,
+                args.revo2_feedback_connect,
+                args.revo2_controller_id,
+                args.permit_revo2_actuation,
+            )
+        ):
+            parser.error("Revo2 hand control requires --manager")
         # Run legacy single-thread pose streaming
         run_pico(
             buffer_size=args.buffer_size,
