@@ -40,7 +40,6 @@ from gear_sonic.utils.teleop.revo2_hand_sender import (
     Revo2HandSender,
     Revo2PoseProfile,
     Revo2TeleopError,
-    SonicControlGate,
     require_fresh_trigger_source,
 )
 from gear_sonic.utils.teleop.zmq.zmq_poller import ZMQPoller
@@ -1676,11 +1675,6 @@ class FeedbackReader:
 
     def __init__(self, zmq_feedback_host: str = "localhost", zmq_feedback_port: int = 5557):
         self.poller = ZMQPoller(host=zmq_feedback_host, port=zmq_feedback_port, topic="g1_debug")
-        self.control_poller = ZMQPoller(
-            host=zmq_feedback_host,
-            port=zmq_feedback_port,
-            topic="sonic_control_status",
-        )
 
         self.upper_body_joint_indices = self._get_upper_body_joint_indices()
 
@@ -1690,7 +1684,6 @@ class FeedbackReader:
         # Full body joint configuration (29 DOFs) as measured from robot,
         # used for FK when recalibrating VR 3PT tracking against actual robot pose
         self.full_body_q_measured: np.ndarray | None = None
-        self.control_gate = SonicControlGate(timeout_ms=150)
 
     def _get_upper_body_joint_indices(self) -> list[int]:
         # TODO: get from robot model, not hardcoded
@@ -1707,18 +1700,6 @@ class FeedbackReader:
             self.full_body_q_measured,
         ) = self._process_upper_body_position_targets()
         print("[PlannerLoop] Saved upper body position target:", self.upper_body_position_target)
-
-    def poll_control_permission(self) -> bool:
-        """Return true only for a fresh, explicit C++ external-hand heartbeat."""
-        now_ns = time.monotonic_ns()
-        data = self.control_poller.get_data()
-        if data is not None:
-            try:
-                unpacked = msgpack.unpackb(data, raw=False, strict_map_key=True)
-            except (msgpack.ExtraData, msgpack.FormatError, msgpack.StackError, ValueError):
-                unpacked = None
-            self.control_gate.accept(unpacked, received_ns=now_ns)
-        return self.control_gate.permitted(now_ns=now_ns)
 
     def _process_upper_body_position_targets(
         self,
@@ -1945,14 +1926,12 @@ def _start_revo2_hand_sender(
     profile_path: str | None,
     command_bind: str | None,
     feedback_connect: str | None,
-    controller_id: str | None,
     permit_actuation: bool,
 ) -> Revo2HandSender | None:
     config = {
         "profile": profile_path,
         "command bind endpoint": command_bind,
         "feedback connect endpoint": feedback_connect,
-        "controller ID": controller_id,
     }
     configured = [value is not None for value in config.values()]
     if not any(configured) and not permit_actuation:
@@ -1969,13 +1948,11 @@ def _start_revo2_hand_sender(
     assert profile_path is not None
     assert command_bind is not None
     assert feedback_connect is not None
-    assert controller_id is not None
 
     profile = Revo2PoseProfile.from_json(profile_path)
     sender = Revo2HandSender(
         command_bind,
         feedback_connect,
-        controller_id=controller_id,
         profile=profile,
         permit_actuation=True,
     )
@@ -2000,7 +1977,6 @@ def run_pico_manager(
     revo2_profile: str | None = None,
     revo2_command_bind: str | None = None,
     revo2_feedback_connect: str | None = None,
-    revo2_controller_id: str | None = None,
     permit_revo2_actuation: bool = False,
 ):
     """
@@ -2014,7 +1990,6 @@ def run_pico_manager(
             revo2_profile,
             revo2_command_bind,
             revo2_feedback_connect,
-            revo2_controller_id,
             permit_revo2_actuation,
         )
     )
@@ -2070,7 +2045,6 @@ def run_pico_manager(
             profile_path=revo2_profile,
             command_bind=revo2_command_bind,
             feedback_connect=revo2_feedback_connect,
-            controller_id=revo2_controller_id,
             permit_actuation=permit_revo2_actuation,
         )
     except BaseException:
@@ -2234,54 +2208,30 @@ def run_pico_manager(
                 planner_streamer.run_once(new_mode)
 
             if revo2_sender is not None and not revo2_faulted:
-                now_ns = time.monotonic_ns()
-                trigger_sample_stale = (
-                    revo2_trigger_sample is not None
-                    and (
-                        now_ns < revo2_trigger_sample[3]
-                        or now_ns - revo2_trigger_sample[3] > 150_000_000
-                    )
-                )
-                if trigger_sample_stale:
-                    revo2_sender.stop()
-                    revo2_faulted = True
-                    print(
-                        "[Manager] Revo2 hand control faulted and stopped: "
-                        "PICO trigger input exceeded the 150 ms freshness limit"
-                    )
-                else:
-                    body_control_permitted = (
-                        planner_streamer.feedback_reader.poll_control_permission()
-                    )
-                    hands_enabled = (
-                        revo2_trigger_sample is not None
-                        and new_mode not in (StreamMode.OFF, StreamMode.POSE_PAUSE)
-                        and body_control_permitted
-                    )
+                try:
                     if revo2_trigger_sample is None:
-                        hand_timestamp_ns = 0
-                        hand_left_trigger = 0.0
-                        hand_right_trigger = 0.0
+                        revo2_sender.stop()
                     else:
                         (
                             hand_timestamp_ns,
                             hand_left_trigger,
                             hand_right_trigger,
-                            _,
+                            hand_received_monotonic_ns,
                         ) = revo2_trigger_sample
-                    try:
                         revo2_sender.update(
-                            source_timestamp_ns=int(hand_timestamp_ns),
-                            left_trigger=float(hand_left_trigger),
-                            right_trigger=float(hand_right_trigger),
-                            enabled=hands_enabled,
+                            source_timestamp_ns=hand_timestamp_ns,
+                            source_received_monotonic_ns=hand_received_monotonic_ns,
+                            left_trigger=hand_left_trigger,
+                            right_trigger=hand_right_trigger,
+                            enabled=new_mode
+                            not in (StreamMode.OFF, StreamMode.POSE_PAUSE),
                         )
-                    except Exception as error:
-                        # Keep a hand transport/protocol failure isolated from the
-                        # body control loop. KeyboardInterrupt/SystemExit still pass.
-                        revo2_faulted = True
-                        revo2_sender.stop()
-                        print(f"[Manager] Revo2 hand control faulted and stopped: {error}")
+                except Exception as error:
+                    # Keep a hand transport/protocol failure isolated from the
+                    # body control loop. KeyboardInterrupt/SystemExit still pass.
+                    revo2_faulted = True
+                    revo2_sender.stop()
+                    print(f"[Manager] Revo2 hand control faulted and stopped: {error}")
 
             # Make sure to send command messages after loop iteration to ensure data arrives before mode switch
             should_exit = False
@@ -2440,15 +2390,14 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--revo2-command-bind",
-        help="Explicit tcp:// endpoint to bind for Revo2 v3 commands",
+        help=(
+            "Explicit AGX data-plane tcp://IPv4:port upstream endpoint to bind "
+            "for the robot-side Revo2 glove relay"
+        ),
     )
     parser.add_argument(
         "--revo2-feedback-connect",
-        help="Explicit tcp:// Revo2 physical-agent feedback endpoint",
-    )
-    parser.add_argument(
-        "--revo2-controller-id",
-        help="Controller identity configured in the Revo2 physical-agent launcher",
+        help="Explicit G1 data-plane tcp://IPv4:port unified-executor feedback endpoint",
     )
     parser.add_argument(
         "--permit-revo2-actuation",
@@ -2499,7 +2448,6 @@ if __name__ == "__main__":
             revo2_profile=args.revo2_profile,
             revo2_command_bind=args.revo2_command_bind,
             revo2_feedback_connect=args.revo2_feedback_connect,
-            revo2_controller_id=args.revo2_controller_id,
             permit_revo2_actuation=args.permit_revo2_actuation,
         )
     else:
@@ -2508,7 +2456,6 @@ if __name__ == "__main__":
                 args.revo2_profile,
                 args.revo2_command_bind,
                 args.revo2_feedback_connect,
-                args.revo2_controller_id,
                 args.permit_revo2_actuation,
             )
         ):

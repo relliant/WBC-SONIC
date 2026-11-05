@@ -1,14 +1,14 @@
 """PICO trigger to BrainCo Revo2 whole-hand command adapter.
 
-This module speaks the existing ``revo2.command.v3`` glove contract.  It never
-opens a serial port and it does not expose per-finger teleoperation: each hand
-has one closure scalar which is interpolated between two validated six-channel
-poses.
+This module publishes the upstream ``revo2.command.v3`` glove contract consumed
+by the robot-side source relay. It never opens a serial port and it does not
+expose per-finger teleoperation: each hand has one closure scalar interpolated
+between two validated six-channel poses.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 import math
 from numbers import Real
@@ -22,12 +22,58 @@ import numpy as np
 
 COMMAND_SCHEMA = "revo2.command.v3"
 FEEDBACK_SCHEMA = "revo2.feedback.v3"
-SONIC_CONTROL_STATUS_SCHEMA = "sonic.control_status.v1"
 COMMAND_SOURCE = "glove"
 COMMAND_LEASE_MS = 200
+TARGET_VALID_MS = 150
+MAX_MEASUREMENT_AGE_NS = 100_000_000
 HAND_CHANNELS = 6
 SIDES = ("left", "right")
 COMMAND_MODES = ("disarm", "arm", "enable", "hold", "stop")
+UNIFIED_CAPABILITIES = {
+    "direct_enable": True,
+    "source_diagnostic_only": True,
+    "body_control_interlock": False,
+}
+_FEEDBACK_FIELDS = frozenset(
+    {
+        "schema",
+        "session_id",
+        "agent_boot_id",
+        "feedback_seq",
+        "agent_monotonic_ns",
+        "accepted_mode",
+        "last_mode_seq",
+        "lease_valid",
+        "lease_remaining_ms",
+        "mode_reject_reason",
+        "global_fault",
+        "capabilities",
+        "actuated_sides",
+        "hands",
+    }
+)
+_FEEDBACK_HAND_FIELDS = frozenset(
+    {
+        "state",
+        "last_received_seq",
+        "last_applied_seq",
+        "last_applied_control_frame_index",
+        "received_agent_monotonic_ns",
+        "applied_agent_monotonic_ns",
+        "requested",
+        "applied",
+        "clipped_mask",
+        "position_raw",
+        "position_norm",
+        "speed_raw",
+        "current_raw",
+        "motor_state",
+        "measured_agent_monotonic_ns",
+        "valid",
+        "fault",
+        "reject_reason",
+    }
+)
 
 
 class Revo2TeleopError(RuntimeError):
@@ -41,6 +87,30 @@ def require_fresh_trigger_source(input_source: str) -> None:
             "Revo2 actuation requires --input-source xrt: Isaac Teleop 1.4 "
             "DeviceIO does not expose controller-origin sample timestamps"
         )
+
+
+def explicit_tcp_ipv4_endpoint(value: str, path: str) -> str:
+    """Require the same explicit data-plane endpoint form as the robot relay."""
+    if not isinstance(value, str) or not value.startswith("tcp://"):
+        raise Revo2TeleopError(f"{path} must be tcp://<explicit-ipv4>:<port>")
+    address, separator, port_text = value[6:].partition(":")
+    parts = address.split(".")
+    if (
+        not separator
+        or len(parts) != 4
+        or any(not part.isdigit() for part in parts)
+        or any(len(part) > 1 and part.startswith("0") for part in parts)
+    ):
+        raise Revo2TeleopError(f"{path} must use an explicit IPv4 address")
+    octets = [int(part) for part in parts]
+    if any(part > 255 for part in octets) or address in ("0.0.0.0", "255.255.255.255"):
+        raise Revo2TeleopError(f"{path} must use a non-wildcard IPv4 address")
+    if not port_text.isdigit() or (len(port_text) > 1 and port_text.startswith("0")):
+        raise Revo2TeleopError(f"{path} port must be plain decimal digits")
+    port = int(port_text)
+    if not 1024 <= port <= 65535:
+        raise Revo2TeleopError(f"{path} port must be between 1024 and 65535")
+    return f"tcp://{address}:{port}"
 
 
 def _six_finite_normalized(value: Any, path: str) -> np.ndarray:
@@ -65,6 +135,9 @@ class Revo2PoseProfile:
     open_poses: Mapping[str, np.ndarray]
     closed_poses: Mapping[str, np.ndarray]
     max_close_ratio: float = 1.0
+    _scaled_deltas: Mapping[str, np.ndarray] = field(
+        init=False, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         if set(self.open_poses) != set(SIDES) or set(self.closed_poses) != set(SIDES):
@@ -85,6 +158,14 @@ class Revo2PoseProfile:
         }
         object.__setattr__(self, "open_poses", open_poses)
         object.__setattr__(self, "closed_poses", closed_poses)
+        object.__setattr__(
+            self,
+            "_scaled_deltas",
+            {
+                side: self.max_close_ratio * (closed_poses[side] - open_poses[side])
+                for side in SIDES
+            },
+        )
 
     @classmethod
     def from_json(cls, path: str | Path) -> "Revo2PoseProfile":
@@ -104,119 +185,32 @@ class Revo2PoseProfile:
         return cls(value["open"], value["closed"], value["max_close_ratio"])
 
     def targets(self, left_trigger: float, right_trigger: float) -> dict[str, list[float]]:
-        triggers = {"left": left_trigger, "right": right_trigger}
         result: dict[str, list[float]] = {}
-        for side in SIDES:
-            trigger = float(triggers[side])
+        for side, raw_trigger in (("left", left_trigger), ("right", right_trigger)):
+            trigger = float(raw_trigger)
             if not math.isfinite(trigger):
                 raise Revo2TeleopError(f"{side} trigger must be finite")
-            closure = float(np.clip(trigger, 0.0, 1.0)) * self.max_close_ratio
-            target = self.open_poses[side] + closure * (
-                self.closed_poses[side] - self.open_poses[side]
-            )
-            result[side] = [float(item) for item in np.clip(target, 0.0, 1.0)]
+            closure = min(max(trigger, 0.0), 1.0)
+            target = self.open_poses[side] + closure * self._scaled_deltas[side]
+            result[side] = target.tolist()
         return result
-
-
-@dataclass(frozen=True)
-class SonicControlStatus:
-    sequence: int
-    control_enabled: bool
-    operator_stop: bool
-    hand_mode: str
-
-
-def parse_sonic_control_status(value: Any) -> SonicControlStatus:
-    """Validate the C++ heartbeat used to interlock external hand actuation."""
-
-    expected = {
-        "schema",
-        "sequence",
-        "control_enabled",
-        "operator_stop",
-        "hand_mode",
-    }
-    if not isinstance(value, dict) or set(value) != expected:
-        raise Revo2TeleopError("unexpected SONIC control status fields")
-    if value["schema"] != SONIC_CONTROL_STATUS_SCHEMA:
-        raise Revo2TeleopError("unexpected SONIC control status schema")
-    if type(value["sequence"]) is not int or value["sequence"] < 0:
-        raise Revo2TeleopError("SONIC control status sequence is invalid")
-    if type(value["control_enabled"]) is not bool or type(value["operator_stop"]) is not bool:
-        raise Revo2TeleopError("SONIC control status flags must be boolean")
-    if value["hand_mode"] not in ("dex3", "external"):
-        raise Revo2TeleopError("SONIC control status hand_mode is invalid")
-    return SonicControlStatus(
-        sequence=value["sequence"],
-        control_enabled=value["control_enabled"],
-        operator_stop=value["operator_stop"],
-        hand_mode=value["hand_mode"],
-    )
-
-
-class SonicControlGate:
-    """Latch-safe freshness gate for the C++ SONIC control heartbeat."""
-
-    def __init__(self, timeout_ms: int = 150) -> None:
-        if timeout_ms <= 0 or timeout_ms >= COMMAND_LEASE_MS:
-            raise Revo2TeleopError("SONIC status timeout must be inside the command lease")
-        self.timeout_ns = timeout_ms * 1_000_000
-        self.last_sequence: int | None = None
-        self.last_received_ns: int | None = None
-        self.control_enabled = False
-        self.latched_fault: str | None = None
-
-    def accept(self, value: Any, *, received_ns: int) -> None:
-        if self.latched_fault is not None:
-            return
-        if type(received_ns) is not int or received_ns < 0:
-            self.latched_fault = "SONIC status receive timestamp is invalid"
-            self.control_enabled = False
-            return
-        try:
-            status = parse_sonic_control_status(value)
-        except Revo2TeleopError as error:
-            self.latched_fault = str(error)
-            self.control_enabled = False
-            return
-        if self.last_sequence is not None and status.sequence <= self.last_sequence:
-            self.latched_fault = "SONIC control status sequence did not advance"
-            self.control_enabled = False
-            return
-        self.last_sequence = status.sequence
-        self.last_received_ns = received_ns
-        self.control_enabled = (
-            status.control_enabled and not status.operator_stop and status.hand_mode == "external"
-        )
-
-    def permitted(self, *, now_ns: int) -> bool:
-        if self.latched_fault is not None or self.last_received_ns is None:
-            return False
-        if type(now_ns) is not int or now_ns < self.last_received_ns:
-            self.latched_fault = "SONIC status clock moved backwards"
-            self.control_enabled = False
-            return False
-        if now_ns - self.last_received_ns > self.timeout_ns:
-            self.control_enabled = False
-        return self.control_enabled
 
 
 def command_packet(
     mode: str,
     *,
     session_id: str,
-    controller_id: str,
     seq: int,
     control_frame_index: int,
     sender_monotonic_ns: int,
     targets: Mapping[str, list[float]] | None = None,
 ) -> dict[str, Any]:
-    """Build one exact ``revo2.command.v3`` glove packet."""
+    """Build one exact upstream ``revo2.command.v3`` glove packet."""
 
     if mode not in COMMAND_MODES:
         raise Revo2TeleopError(f"invalid Revo2 command mode: {mode}")
-    if not session_id or not controller_id:
-        raise Revo2TeleopError("session_id and controller_id must be nonempty")
+    if not session_id:
+        raise Revo2TeleopError("session_id must be nonempty")
     for name, value in (
         ("seq", seq),
         ("control_frame_index", control_frame_index),
@@ -251,7 +245,6 @@ def command_packet(
     return {
         "schema": COMMAND_SCHEMA,
         "session_id": session_id,
-        "controller_id": controller_id,
         "seq": seq,
         "control_frame_index": control_frame_index,
         "sender_monotonic_ns": sender_monotonic_ns,
@@ -264,18 +257,26 @@ def command_packet(
 
 
 @dataclass(frozen=True)
+class Revo2HandFeedback:
+    state: str
+    measured_agent_monotonic_ns: int
+    valid: bool
+    fault: str
+    reject_reason: str
+
+
+@dataclass(frozen=True)
 class Revo2Feedback:
     session_id: str
     agent_boot_id: str
     feedback_seq: int
+    agent_monotonic_ns: int
     accepted_mode: str
     last_mode_seq: int
     lease_valid: bool
     global_fault: str
     mode_reject_reason: str
-    hand_valid: bool
-    hand_faults: tuple[str, ...]
-    hand_reject_reasons: tuple[str, ...]
+    hands: Mapping[str, Revo2HandFeedback]
 
 
 def _feedback_integer(value: Any, path: str, *, minimum: int | None = None) -> int:
@@ -299,28 +300,8 @@ def _feedback_normalized_vector(value: Any, path: str) -> None:
             raise Revo2TeleopError(f"{path} contains an invalid normalized value")
 
 
-def _parse_feedback_hand(value: Any, path: str) -> tuple[bool, str, str]:
-    fields = {
-        "state",
-        "last_received_seq",
-        "last_applied_seq",
-        "last_applied_control_frame_index",
-        "received_agent_monotonic_ns",
-        "applied_agent_monotonic_ns",
-        "requested",
-        "applied",
-        "clipped_mask",
-        "position_raw",
-        "position_norm",
-        "speed_raw",
-        "current_raw",
-        "motor_state",
-        "measured_agent_monotonic_ns",
-        "valid",
-        "fault",
-        "reject_reason",
-    }
-    if type(value) is not dict or set(value) != fields:
+def _parse_feedback_hand(value: Any, path: str, agent_monotonic_ns: int) -> Revo2HandFeedback:
+    if type(value) is not dict or set(value) != _FEEDBACK_HAND_FIELDS:
         raise Revo2TeleopError(f"{path} fields are invalid")
     if value["state"] not in {
         "disarmed",
@@ -333,18 +314,17 @@ def _parse_feedback_hand(value: Any, path: str) -> tuple[bool, str, str]:
         "unavailable",
     }:
         raise Revo2TeleopError(f"{path}.state is invalid")
-    for name in (
-        "last_received_seq",
-        "last_applied_seq",
-        "last_applied_control_frame_index",
-    ):
+    for name in ("last_received_seq", "last_applied_seq", "last_applied_control_frame_index"):
         _feedback_integer(value[name], f"{path}.{name}", minimum=-1)
-    for name in (
-        "received_agent_monotonic_ns",
-        "applied_agent_monotonic_ns",
-        "measured_agent_monotonic_ns",
-    ):
+    for name in ("received_agent_monotonic_ns", "applied_agent_monotonic_ns"):
         _feedback_integer(value[name], f"{path}.{name}", minimum=0)
+    measured_ns = _feedback_integer(
+        value["measured_agent_monotonic_ns"],
+        f"{path}.measured_agent_monotonic_ns",
+        minimum=1,
+    )
+    if not 0 <= agent_monotonic_ns - measured_ns < MAX_MEASUREMENT_AGE_NS:
+        raise Revo2TeleopError(f"{path} measurement is stale")
     for name in ("requested", "applied", "position_norm"):
         _feedback_normalized_vector(value[name], f"{path}.{name}")
     _feedback_vector(value["clipped_mask"], f"{path}.clipped_mask", bool)
@@ -357,43 +337,47 @@ def _parse_feedback_hand(value: Any, path: str) -> tuple[bool, str, str]:
     for name in ("fault", "reject_reason"):
         if type(value[name]) is not str:
             raise Revo2TeleopError(f"{path}.{name} must be a string")
-    return value["valid"], value["fault"], value["reject_reason"]
+    return Revo2HandFeedback(
+        state=value["state"],
+        measured_agent_monotonic_ns=measured_ns,
+        valid=value["valid"],
+        fault=value["fault"],
+        reject_reason=value["reject_reason"],
+    )
 
 
 def parse_feedback(value: Any) -> Revo2Feedback:
-    """Strictly validate the v3 feedback used by the sender interlock."""
+    """Strictly validate unified v3 feedback used for health diagnostics."""
 
-    expected = {
-        "schema",
-        "session_id",
-        "agent_boot_id",
-        "feedback_seq",
-        "agent_monotonic_ns",
-        "accepted_mode",
-        "last_mode_seq",
-        "lease_valid",
-        "lease_remaining_ms",
-        "mode_reject_reason",
-        "global_fault",
-        "actuated_sides",
-        "hands",
-    }
-    if type(value) is not dict or set(value) != expected or value.get("schema") != FEEDBACK_SCHEMA:
+    if (
+        type(value) is not dict
+        or set(value) != _FEEDBACK_FIELDS
+        or value.get("schema") != FEEDBACK_SCHEMA
+    ):
         raise Revo2TeleopError("unexpected Revo2 feedback schema or fields")
+    capabilities = value["capabilities"]
+    if (
+        type(capabilities) is not dict
+        or set(capabilities) != set(UNIFIED_CAPABILITIES)
+        or any(
+            type(capabilities[name]) is not bool
+            or capabilities[name] is not expected_value
+            for name, expected_value in UNIFIED_CAPABILITIES.items()
+        )
+    ):
+        raise Revo2TeleopError("feedback capabilities do not identify the unified executor")
     if value["actuated_sides"] != list(SIDES):
         raise Revo2TeleopError("Revo2 feedback must report left and right hands")
     if type(value["hands"]) is not dict or set(value["hands"]) != set(SIDES):
         raise Revo2TeleopError("Revo2 feedback hand topology does not match the command")
     if value["accepted_mode"] not in COMMAND_MODES:
         raise Revo2TeleopError("Revo2 feedback contains an invalid accepted mode")
-    _feedback_integer(value["feedback_seq"], "feedback.feedback_seq", minimum=0)
-    _feedback_integer(value["last_mode_seq"], "feedback.last_mode_seq", minimum=-1)
-    _feedback_integer(
-        value["agent_monotonic_ns"], "feedback.agent_monotonic_ns", minimum=0
+    feedback_seq = _feedback_integer(value["feedback_seq"], "feedback.feedback_seq", minimum=0)
+    last_mode_seq = _feedback_integer(value["last_mode_seq"], "feedback.last_mode_seq", minimum=-1)
+    agent_monotonic_ns = _feedback_integer(
+        value["agent_monotonic_ns"], "feedback.agent_monotonic_ns", minimum=1
     )
-    _feedback_integer(
-        value["lease_remaining_ms"], "feedback.lease_remaining_ms", minimum=0
-    )
+    _feedback_integer(value["lease_remaining_ms"], "feedback.lease_remaining_ms", minimum=0)
     if type(value["lease_valid"]) is not bool:
         raise Revo2TeleopError("feedback lease_valid must be boolean")
     for name in ("session_id", "agent_boot_id"):
@@ -403,54 +387,55 @@ def parse_feedback(value: Any) -> Revo2Feedback:
         if type(value[name]) is not str:
             raise Revo2TeleopError(f"feedback {name} must be a string")
 
-    hand_status = [
-        _parse_feedback_hand(value["hands"][side], f"feedback.hands.{side}")
+    hands = {
+        side: _parse_feedback_hand(
+            value["hands"][side], f"feedback.hands.{side}", agent_monotonic_ns
+        )
         for side in SIDES
-    ]
+    }
     return Revo2Feedback(
         session_id=value["session_id"],
         agent_boot_id=value["agent_boot_id"],
-        feedback_seq=value["feedback_seq"],
+        feedback_seq=feedback_seq,
+        agent_monotonic_ns=agent_monotonic_ns,
         accepted_mode=value["accepted_mode"],
-        last_mode_seq=value["last_mode_seq"],
+        last_mode_seq=last_mode_seq,
         lease_valid=value["lease_valid"],
         global_fault=value["global_fault"],
         mode_reject_reason=value["mode_reject_reason"],
-        hand_valid=all(status[0] for status in hand_status),
-        hand_faults=tuple(status[1] for status in hand_status),
-        hand_reject_reasons=tuple(status[2] for status in hand_status),
+        hands=hands,
     )
 
 
 class Revo2HandSender:
-    """Non-blocking glove publisher with feedback-gated arm/enable transitions."""
+    """Non-blocking upstream glove publisher with direct-enable semantics."""
 
     def __init__(
         self,
         command_bind: str,
         feedback_connect: str,
         *,
-        controller_id: str,
         profile: Revo2PoseProfile,
         permit_actuation: bool = False,
         feedback_timeout_ms: int = 500,
+        target_valid_ms: int = TARGET_VALID_MS,
         session_id: str | None = None,
         zmq_module=None,
         clock_ns: Callable[[], int] = time.monotonic_ns,
     ) -> None:
         if permit_actuation is not True:
             raise Revo2TeleopError("Revo2 publishing requires explicit actuation permission")
-        if not command_bind.startswith("tcp://") or not feedback_connect.startswith("tcp://"):
-            raise Revo2TeleopError("Revo2 endpoints must be explicit tcp:// endpoints")
-        if not controller_id:
-            raise Revo2TeleopError("Revo2 controller_id must be nonempty")
+        self.command_bind = explicit_tcp_ipv4_endpoint(command_bind, "Revo2 command bind")
+        self.feedback_connect = explicit_tcp_ipv4_endpoint(
+            feedback_connect, "Revo2 feedback connect"
+        )
         if feedback_timeout_ms <= COMMAND_LEASE_MS:
             raise Revo2TeleopError("feedback timeout must exceed the command lease")
-        self.command_bind = command_bind
-        self.feedback_connect = feedback_connect
-        self.controller_id = controller_id
+        if not 0 < target_valid_ms < COMMAND_LEASE_MS:
+            raise Revo2TeleopError("target validity must be inside the command lease")
         self.profile = profile
         self.feedback_timeout_ns = feedback_timeout_ms * 1_000_000
+        self.target_valid_ns = target_valid_ms * 1_000_000
         self.session_id = session_id or uuid.uuid4().hex
         if zmq_module is None:
             try:
@@ -470,13 +455,13 @@ class Revo2HandSender:
         self.last_feedback: Revo2Feedback | None = None
         self.last_feedback_received_ns: int | None = None
         self.last_feedback_seq: int | None = None
+        self.last_feedback_agent_ns: int | None = None
+        self.last_measured_ns: tuple[int, int] | None = None
         self.last_agent_boot_id: str | None = None
-        self.last_mode_seq = -1
         self.last_requested_mode: str | None = None
-        self.pending_arm_seq: int | None = None
-        self.arm_authorized = False
-        self.first_command_ns: int | None = None
-        self.enabled = False
+        self.first_enable_ns: int | None = None
+        self.target_deadline_ns: int | None = None
+        self.target_active = False
         self.awaiting_trigger_release = True
         self.closed = False
         self.latched_fault: str | None = None
@@ -502,50 +487,24 @@ class Revo2HandSender:
             raise
         return self
 
-    def _drain_feedback(self, now_ns: int) -> None:
-        if self.feedback is None:
-            return
-        while True:
-            try:
-                payload = self.feedback.recv(flags=self.zmq.DONTWAIT)
-            except self.zmq.Again:
-                return
-            try:
-                packet = parse_feedback(
-                    msgpack.unpackb(payload, raw=False, strict_map_key=True)
-                )
-            except Exception as error:
-                self.latched_fault = f"invalid Revo2 feedback: {error}"
-                raise Revo2TeleopError(self.latched_fault) from error
-            if self.last_agent_boot_id == packet.agent_boot_id:
-                if (
-                    self.last_feedback_seq is not None
-                    and packet.feedback_seq <= self.last_feedback_seq
-                ):
-                    self.latched_fault = "Revo2 feedback sequence did not advance"
-                    raise Revo2TeleopError(self.latched_fault)
-            elif self.last_agent_boot_id is not None:
-                self.latched_fault = "Revo2 agent restarted"
-                raise Revo2TeleopError(self.latched_fault)
-            self.last_agent_boot_id = packet.agent_boot_id
-            self.last_feedback_seq = packet.feedback_seq
-            self.last_feedback = packet
-            self.last_feedback_received_ns = now_ns
-
-    def _publish(self, mode: str, *, targets: Mapping[str, list[float]] | None, now_ns: int) -> int:
+    def _publish(
+        self,
+        mode: str,
+        *,
+        targets: Mapping[str, list[float]] | None,
+        now_ns: int,
+    ) -> int:
         if self.command is None or self.closed:
             raise Revo2TeleopError("Revo2 sender is not open")
         packet_seq = self.seq
         packet = command_packet(
             mode,
             session_id=self.session_id,
-            controller_id=self.controller_id,
             seq=packet_seq,
             control_frame_index=self.frame,
             sender_monotonic_ns=now_ns,
             targets=targets,
         )
-        # Drain XPUB subscription notifications without ever blocking actuation.
         try:
             for _ in range(8):
                 try:
@@ -561,181 +520,174 @@ class Revo2HandSender:
             self.latched_fault = f"Revo2 command transport failed: {error}"
             raise Revo2TeleopError(self.latched_fault) from error
         self.seq += 1
-        self.last_mode_seq = packet_seq
         self.last_requested_mode = mode
-        if self.first_command_ns is None:
-            self.first_command_ns = now_ns
+        if mode == "enable" and self.first_enable_ns is None:
+            self.first_enable_ns = now_ns
         return packet_seq
+
+    def _cancel_active_target(self, now_ns: int) -> bool:
+        should_publish = self.target_active
+        try:
+            if should_publish:
+                self._publish("stop", targets=None, now_ns=now_ns)
+        except BaseException:
+            pass
+        self.target_active = False
+        self.target_deadline_ns = None
+        return should_publish
+
+    def _raise_fault(self, message: str, now_ns: int) -> None:
+        if self.latched_fault is None:
+            self.latched_fault = message
+        self._cancel_active_target(now_ns)
+        raise Revo2TeleopError(self.latched_fault)
+
+    def _drain_feedback(self, now_ns: int) -> None:
+        if self.feedback is None:
+            return
+        while True:
+            try:
+                payload = self.feedback.recv(flags=self.zmq.DONTWAIT)
+            except self.zmq.Again:
+                return
+            try:
+                packet = parse_feedback(msgpack.unpackb(payload, raw=False, strict_map_key=True))
+            except Exception as error:
+                self._raise_fault(f"invalid Revo2 feedback: {error}", now_ns)
+
+            measured = tuple(
+                packet.hands[side].measured_agent_monotonic_ns for side in SIDES
+            )
+            if self.last_agent_boot_id == packet.agent_boot_id:
+                if self.last_feedback_seq is not None and packet.feedback_seq <= self.last_feedback_seq:
+                    self._raise_fault("Revo2 feedback sequence did not advance", now_ns)
+                if (
+                    self.last_feedback_agent_ns is not None
+                    and packet.agent_monotonic_ns <= self.last_feedback_agent_ns
+                ):
+                    self._raise_fault("Revo2 feedback clock did not advance", now_ns)
+                if self.last_measured_ns is not None and any(
+                    current < previous
+                    for current, previous in zip(measured, self.last_measured_ns)
+                ):
+                    self._raise_fault("Revo2 hand measurement clock moved backwards", now_ns)
+            elif self.last_agent_boot_id is not None:
+                self._raise_fault("Revo2 agent restarted", now_ns)
+
+            if packet.global_fault:
+                self._raise_fault("Revo2 agent fault: " + packet.global_fault, now_ns)
+            for side in SIDES:
+                hand = packet.hands[side]
+                if hand.fault:
+                    self._raise_fault(f"Revo2 {side} hand fault: {hand.fault}", now_ns)
+                if hand.state in ("fault", "unavailable", "stale"):
+                    self._raise_fault(f"Revo2 {side} hand state is {hand.state}", now_ns)
+
+            self.last_agent_boot_id = packet.agent_boot_id
+            self.last_feedback_seq = packet.feedback_seq
+            self.last_feedback_agent_ns = packet.agent_monotonic_ns
+            self.last_measured_ns = measured
+            self.last_feedback = packet
+            self.last_feedback_received_ns = now_ns
+
+    def _check_feedback_timeout(self, now_ns: int) -> None:
+        if self.first_enable_ns is None:
+            return
+        reference_ns = self.last_feedback_received_ns or self.first_enable_ns
+        if now_ns - reference_ns > self.feedback_timeout_ns:
+            self._raise_fault("Revo2 feedback timed out", now_ns)
+
+    def _expire_target(self, now_ns: int) -> bool:
+        if (
+            self.target_active
+            and self.target_deadline_ns is not None
+            and now_ns >= self.target_deadline_ns
+        ):
+            self.stop(now_ns=now_ns)
+            return True
+        return False
 
     def update(
         self,
         *,
         source_timestamp_ns: int,
+        source_received_monotonic_ns: int,
         left_trigger: float,
         right_trigger: float,
         enabled: bool,
     ) -> str | None:
-        """Process one fresh PICO sample and advance the arm/enable state machine.
+        """Process one PICO sample without replaying or renewing duplicate input."""
 
-        A duplicate source timestamp sends nothing and therefore cannot renew the
-        agent's lease.  A rollback latches the sender until a new process/session.
-        """
-
-        if type(source_timestamp_ns) is not int or source_timestamp_ns < 0:
-            raise Revo2TeleopError("PICO source timestamp must be a non-negative integer")
         now_ns = self.clock_ns()
-
-        # A disable/stop request is independent of source and feedback validity.
-        # Malformed queued feedback must never preempt the stop publication.
         if not enabled:
-            if self.enabled or self.last_requested_mode not in (None, "stop", "disarm"):
-                self._publish("stop", targets=None, now_ns=now_ns)
-            self.enabled = False
-            self.awaiting_trigger_release = True
-            self.pending_arm_seq = None
-            self.arm_authorized = False
-            self.last_feedback = None
-            self.last_feedback_received_ns = None
-            self.first_command_ns = None
-            return "stop"
+            return "stop" if self.stop(now_ns=now_ns) else None
+        if self.latched_fault is not None:
+            raise Revo2TeleopError(self.latched_fault)
 
         self._drain_feedback(now_ns)
-
-        # Zero means PicoReader has not produced its first real sample yet. Do not
-        # use startup defaults to satisfy the trigger-release interlock or arm.
-        if source_timestamp_ns == 0:
-            return None
+        self._check_feedback_timeout(now_ns)
+        if type(source_timestamp_ns) is not int or source_timestamp_ns < 0:
+            self._raise_fault("PICO source timestamp must be a non-negative integer", now_ns)
+        if type(source_received_monotonic_ns) is not int or source_received_monotonic_ns < 0:
+            self._raise_fault("PICO receive timestamp must be a non-negative integer", now_ns)
         for side, trigger in (("left", left_trigger), ("right", right_trigger)):
             if not math.isfinite(trigger):
-                raise Revo2TeleopError(f"{side} trigger must be finite")
+                self._raise_fault(f"{side} trigger must be finite", now_ns)
 
         if self.last_source_timestamp_ns is not None:
             if source_timestamp_ns == self.last_source_timestamp_ns:
+                self._expire_target(now_ns)
                 return None
             if source_timestamp_ns < self.last_source_timestamp_ns:
-                self.latched_fault = "PICO source timestamp moved backwards"
-                self.stop()
-                raise Revo2TeleopError(self.latched_fault)
+                self._raise_fault("PICO source timestamp moved backwards", now_ns)
+        if source_timestamp_ns == 0:
+            self._expire_target(now_ns)
+            return None
         self.last_source_timestamp_ns = source_timestamp_ns
         self.frame += 1
 
-        if self.latched_fault:
-            raise Revo2TeleopError(self.latched_fault)
+        if now_ns < source_received_monotonic_ns:
+            self._raise_fault("PICO receive clock moved backwards", now_ns)
+        target_deadline_ns = source_received_monotonic_ns + self.target_valid_ns
+        if now_ns >= target_deadline_ns:
+            self.stop(now_ns=now_ns)
+            return "stale"
+
         if self.awaiting_trigger_release:
             if left_trigger > 0.05 or right_trigger > 0.05:
                 return "await_trigger_release"
             self.awaiting_trigger_release = False
-        self.enabled = True
 
-        feedback = self.last_feedback
-        if feedback is not None and feedback.global_fault:
-            self.latched_fault = "Revo2 agent fault: " + feedback.global_fault
-            self.stop()
+        targets = self.profile.targets(left_trigger, right_trigger)
+        packet_seq = self._publish("enable", targets=targets, now_ns=now_ns)
+        if packet_seq < 0:
+            return None
+        self.target_active = True
+        self.target_deadline_ns = target_deadline_ns
+        return "enable"
+
+    def tick(self, *, now_ns: int | None = None) -> str | None:
+        """Observe feedback and cancel one expired target without replaying it."""
+        if self.closed:
+            return None
+        current_ns = self.clock_ns() if now_ns is None else now_ns
+        if type(current_ns) is not int or current_ns < 0:
+            raise Revo2TeleopError("Revo2 tick timestamp must be a non-negative integer")
+        if self.latched_fault is not None:
             raise Revo2TeleopError(self.latched_fault)
-        if feedback is not None and feedback.mode_reject_reason:
-            self.latched_fault = "Revo2 mode rejected: " + feedback.mode_reject_reason
-            self.stop()
-            raise Revo2TeleopError(self.latched_fault)
-        if feedback is not None and not feedback.hand_valid:
-            self.latched_fault = "Revo2 hand feedback is invalid"
-            self.stop()
-            raise Revo2TeleopError(self.latched_fault)
-        if feedback is not None and any(feedback.hand_faults):
-            self.latched_fault = "Revo2 hand fault: " + next(
-                fault for fault in feedback.hand_faults if fault
-            )
-            self.stop()
-            raise Revo2TeleopError(self.latched_fault)
-        if feedback is not None and any(feedback.hand_reject_reasons):
-            self.latched_fault = "Revo2 hand command rejected: " + next(
-                reason for reason in feedback.hand_reject_reasons if reason
-            )
-            self.stop()
-            raise Revo2TeleopError(self.latched_fault)
-        feedback_reference_ns = self.last_feedback_received_ns or self.first_command_ns
-        if (
-            feedback_reference_ns is not None
-            and now_ns - feedback_reference_ns > self.feedback_timeout_ns
-        ):
-            self.latched_fault = "Revo2 feedback timed out"
-            self.stop()
-            raise Revo2TeleopError(self.latched_fault)
+        self._drain_feedback(current_ns)
+        self._check_feedback_timeout(current_ns)
+        return "stop" if self._expire_target(current_ns) else None
 
-        feedback_matches_session = (
-            feedback is not None and feedback.session_id == self.session_id
-        )
-
-        # Every startup or stop begins a new arm cycle. Feedback saying "enable"
-        # can be delayed from before a stop, so only an acknowledgement of an arm
-        # sent in this cycle can authorize targets.
-        if not self.arm_authorized:
-            if (
-                feedback_matches_session
-                and feedback.accepted_mode == "arm"
-                and self.pending_arm_seq is not None
-            ):
-                if not feedback.lease_valid:
-                    arm_seq = self._publish("arm", targets=None, now_ns=now_ns)
-                    if arm_seq >= 0:
-                        self.pending_arm_seq = arm_seq
-                    return "arm"
-                if feedback.last_mode_seq < self.pending_arm_seq:
-                    # Freeze the pending sequence instead of racing it forward;
-                    # the next feedback sample can then acknowledge that command.
-                    return "await_arm_ack"
-                self.arm_authorized = True
-                self.pending_arm_seq = None
-            else:
-                arm_seq = self._publish("arm", targets=None, now_ns=now_ns)
-                if arm_seq >= 0:
-                    self.pending_arm_seq = arm_seq
-                return "arm"
-
-        if not feedback_matches_session or feedback.accepted_mode in ("disarm", "stop"):
-            self.arm_authorized = False
-            arm_seq = self._publish("arm", targets=None, now_ns=now_ns)
-            if arm_seq >= 0:
-                self.pending_arm_seq = arm_seq
-            return "arm"
-
-        if feedback.accepted_mode == "arm":
-            targets = self.profile.targets(left_trigger, right_trigger)
-            self._publish("enable", targets=targets, now_ns=now_ns)
-            return "enable"
-
-        if feedback.accepted_mode == "enable":
-            if not feedback.lease_valid:
-                self.arm_authorized = False
-                arm_seq = self._publish("arm", targets=None, now_ns=now_ns)
-                if arm_seq >= 0:
-                    self.pending_arm_seq = arm_seq
-                return "arm"
-            targets = self.profile.targets(left_trigger, right_trigger)
-            self._publish("enable", targets=targets, now_ns=now_ns)
-            return "enable"
-
-        # Hold is never entered by this adapter. Re-arm explicitly instead of
-        # silently treating a hold acknowledgement as permission to move.
-        self.arm_authorized = False
-        arm_seq = self._publish("arm", targets=None, now_ns=now_ns)
-        if arm_seq >= 0:
-            self.pending_arm_seq = arm_seq
-        return "arm"
-
-    def stop(self) -> None:
+    def stop(self, *, now_ns: int | None = None) -> bool:
         if self.command is None or self.closed:
-            return
-        try:
-            self._publish("stop", targets=None, now_ns=self.clock_ns())
-        except BaseException:
-            pass
-        self.enabled = False
+            return False
         self.awaiting_trigger_release = True
-        self.pending_arm_seq = None
-        self.arm_authorized = False
-        self.last_feedback = None
-        self.last_feedback_received_ns = None
-        self.first_command_ns = None
+        if not self.target_active:
+            self.target_deadline_ns = None
+            return False
+        current_ns = self.clock_ns() if now_ns is None else now_ns
+        return self._cancel_active_target(current_ns)
 
     def close(self) -> None:
         if self.closed:
@@ -743,7 +695,6 @@ class Revo2HandSender:
         if self.command is not None:
             try:
                 self.stop()
-                self._publish("disarm", targets=None, now_ns=self.clock_ns())
             except BaseException:
                 pass
         self.closed = True

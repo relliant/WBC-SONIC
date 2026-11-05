@@ -4,14 +4,15 @@ Includes action processing, observation preparation, latency compensation,
 and inference scheduling logic.
 """
 
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 import numpy as np
 
-from gear_sonic.data.robot_model.robot_model import RobotModel
+if TYPE_CHECKING:
+    from gear_sonic.data.robot_model.robot_model import RobotModel
 
 
-def concat_action(robot_model: RobotModel, goal: Dict[str, Any]) -> Dict[str, Any]:
+def concat_action(robot_model: "RobotModel", goal: Dict[str, Any]) -> Dict[str, Any]:
     """Process the action dict from the policy into a flat dict.
 
     Strips ``action.`` prefixes from keys (if present) and returns the result.
@@ -29,7 +30,7 @@ def concat_action(robot_model: RobotModel, goal: Dict[str, Any]) -> Dict[str, An
     return processed_goal
 
 
-def prepare_observation_for_eval(robot_model: RobotModel, obs: dict) -> dict:
+def prepare_observation_for_eval(robot_model: "RobotModel", obs: dict) -> dict:
     """Split whole-body ``q`` into per-joint-group state keys for the policy.
 
     Populates ``obs["state"]`` with ``left_arm``, ``right_arm``, ``waist``,

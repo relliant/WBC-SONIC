@@ -1,6 +1,6 @@
 # PICO proportional whole-hand control for BrainCo Revo2
 
-This integration keeps SONIC whole-body teleoperation on its existing ZMQ path and sends hand commands over a separate `revo2.command.v3` path to the robot-side Revo2 physical agent. It does not add ROS and does not open the USB-to-RS485 adapters from this repository.
+This integration keeps SONIC whole-body teleoperation on its existing ZMQ path and publishes a separate upstream `revo2.command.v3` glove stream for the robot-side unified hand service. It does not add ROS, open the USB-to-RS485 adapters, or own the Revo2 SDK from this repository.
 
 Each controller trigger controls one complete hand:
 
@@ -10,43 +10,46 @@ Each controller trigger controls one complete hand:
 - trigger `1` → the configured allowed closed endpoint;
 - intermediate values → proportional interpolation between those endpoints.
 
-The operator does not control individual fingers. The adapter generates the six protocol channels in this order: `thumb_flex`, `thumb_opposition`, `index`, `middle`, `ring`, `pinky`.
+The operator does not control individual fingers. The six protocol channels are `thumb_flex`, `thumb_opposition`, `index`, `middle`, `ring`, and `pinky`.
+
+## Architecture and ownership
+
+```text
+PICO/XRT fresh trigger sample
+    -> GROOT Revo2HandSender on AGX
+       XPUB bind tcp://<AGX-data-plane-IPv4>:5560
+    -> G1 md_wla_hand_source.py --source glove
+       SUB connect to AGX, sole XPUB bind tcp://127.0.0.1:5560
+    -> persistent source-neutral unified executor
+       sole SDK / USB / serial owner
+
+unified executor feedback tcp://0.0.0.0:5561
+    -> GROOT diagnostics and robot-local health probe
+```
+
+The executor service remains named `revo2-physical-agent.service`, but it no longer has glove/policy modes and does not depend on BODY heartbeat, a body run ID, `controller_id`, or an arm acknowledgement. Source selection belongs to the independent relay. Switching between `glove`, `policy`, and `manual_test` means stopping the old relay and starting one new relay; it must not restart the executor or close the serial ports.
+
+The robot-side relay is authoritative and is supplied by the installed `md_wla_brainco` deployment. GROOT does not copy it, launch it through SSH, or manage systemd. Exactly one source relay may own the G1 loopback publisher at a time.
 
 ## Safety prerequisites
 
 Do not enable hand actuation until all of the following have been checked on the target robot:
 
-1. The physical agent and `sonic_contract.py` are the expected pinned versions and accept `revo2.command.v3` / `revo2.feedback.v3` with source `glove`.
-2. The agent's expected controller ID, command endpoint, feedback endpoint, and 200 ms lease agree with the sender configuration.
-3. Both USB-to-RS485 adapters enumerate under stable device paths, with the left and right hand identities verified. Do not infer side from temporary `/dev/ttyUSB*` numbering.
-4. The baud rate and Revo2 slave IDs match the robot configuration (historically 460800 baud, left ID 126, right ID 127; verify rather than assuming these values).
-5. A hardware owner has validated the six-number open and closed pose for each hand. Do not use all-zero/all-one endpoints unless they have been explicitly validated for that hand and firmware.
-6. The SONIC process is launched with `--hand-mode external`. Running the Dex3 publisher and Revo2 actuation at the same time is unsupported.
+1. The persistent executor reports unified capabilities exactly as `{"direct_enable": true, "source_diagnostic_only": true, "body_control_interlock": false}`.
+2. A robot-local `md_wla_hand_health.py` probe observes the same boot with advancing feedback, agent and per-hand measurement clocks, fresh measurements for both hands, and no fault.
+3. The AGX upstream endpoint, G1 relay input endpoint, public feedback endpoint, and 200 ms lease agree.
+4. Both adapters and physical hand identities have been verified using stable paths. Do not infer side from temporary `/dev/ttyUSB*` numbering.
+5. A hardware owner has approved the six-number open and closed pose for each hand.
+6. SONIC is launched with `--hand-mode external`, so its Dex3 publisher cannot compete with Revo2. This is backend mutual exclusion, not executor authorization.
+7. No policy or manual-test source relay is already running.
 
-Perform initial hardware validation with an unloaded hand, a clear workspace, reduced close endpoints, and one hand at a time.
+Perform initial hardware validation with unloaded hands, a clear workspace, reduced close endpoints, and one hand at a time. A healthy executor does not by itself prove movement or task acceptance.
 
 ## Pose profile
 
-Create a local JSON file only after measuring and approving the four six-channel endpoint vectors. Wire values are normalized to `[0, 1]`; they are not radians. `max_close_ratio` scales the trigger's allowed travel within the validated open-to-closed interval.
+The repository pins the mondo-g1-6514 profile at `gear_sonic/config/revo2/mondo_g1_6514_pico_pose_profile.v1.json`. In the documented mondo-agx checkout, its absolute path is `/mnt/data/lsy/GROOT-WholeBodyControl/gear_sonic/config/revo2/mondo_g1_6514_pico_pose_profile.v1.json`.
 
-The required schema is:
-
-```text
-{
-  "schema": "revo2.pico_pose_profile.v1",
-  "open": {
-    "left":  [L_thumb_flex_open, L_thumb_opposition_open, L_index_open, L_middle_open, L_ring_open, L_pinky_open],
-    "right": [R_thumb_flex_open, R_thumb_opposition_open, R_index_open, R_middle_open, R_ring_open, R_pinky_open]
-  },
-  "closed": {
-    "left":  [L_thumb_flex_closed, L_thumb_opposition_closed, L_index_closed, L_middle_closed, L_ring_closed, L_pinky_closed],
-    "right": [R_thumb_flex_closed, R_thumb_opposition_closed, R_index_closed, R_middle_closed, R_ring_closed, R_pinky_closed]
-  },
-  "max_close_ratio": VALIDATED_RATIO_IN_0_TO_1
-}
-```
-
-The symbolic entries above are deliberately not a usable hardware profile. Replace every entry with a validated JSON number. The loader rejects missing/extra keys, non-finite values, vectors of the wrong length, and values outside `[0, 1]`.
+Both hands currently use open `[0.1, 0.9, 0.0, 0.0, 0.0, 0.0]`, closed `[0.5, 0.9, 0.85, 0.85, 0.85, 0.85]`, and `max_close_ratio=1.0`. Wire values are normalized to `[0,1]`; they are not radians. This is an installation-specific profile, not a universal Revo2 default.
 
 For each side, the sender computes:
 
@@ -54,72 +57,95 @@ For each side, the sender computes:
 q_{target} = q_{open} + trigger \cdot max\_close\_ratio \cdot (q_{closed} - q_{open}).
 \]
 
-## Launch
+The loader rejects missing or extra keys, non-finite values, vectors of the wrong length, bool values, and values outside `[0,1]`.
 
-Install the teleoperation dependencies in the Python environment:
+## Unified command and feedback semantics
+
+The upstream command has the exact top-level fields:
+
+```text
+schema, session_id, seq, control_frame_index, sender_monotonic_ns,
+lease_ms, source, mode, actuated_sides, hands
+```
+
+`controller_id` is an illegal legacy field. `source="glove"` is a diagnostic label, not an executor permission. The relay validates the packet and then rewrites its output session, sequence, source, and timestamp before sending it to the executor; consequently executor feedback reports the relay session, not the GROOT upstream session.
+
+A fresh trigger sample directly sends one `enable`; there is no preceding `arm` and no feedback ACK gate. Duplicate controller timestamps send nothing and cannot renew a lease. Timestamp rollback fails closed. The sender uses the locally recorded XRT receipt time for the 150 ms sample-age limit and never subtracts monotonic timestamps from different hosts. An expired target sends one `stop`, clears local target state, and is never replayed.
+
+Wire `arm`, `hold`, `disarm`, and `stop` are cancellation modes, not permission grants. GROOT uses `stop` for cancellation. Its hand entries have `valid=false`; placeholder target numbers are not an open-hand command. Stopping therefore does not automatically release a grasped object.
+
+Feedback is used to verify the unified capability and diagnose boot changes, non-advancing clocks, stale measurements, faults, or timeout. It does not authorize `enable`. Fresh disarmed measurements are healthy even when feedback `valid=false`.
+
+## Launch procedure
+
+Install the teleoperation dependencies on AGX:
 
 ```bash
 pip install -e "gear_sonic[teleop]"
 ```
 
-Launch SONIC with its existing body input and disable the Dex3 backend:
+After separate site authorization, check the already-running executor locally on G1 without opening a command socket:
 
 ```bash
-(cd gear_sonic_deploy && ./deploy.sh --input-type zmq_manager --hand-mode external real)
+cd /home/unitree/lsy/md_wla_deploy
+runtime/hand/venv/bin/python -I -B tools/md_wla_hand_health.py --timeout-s 30
 ```
 
-Start the already-installed robot-side Revo2 physical agent using its verified pinned launcher and `glove`/native-SONIC mode. Do not replace the pinned runtime or enable a different policy-mode service for this path.
+Only after that probe succeeds, start this session's glove relay on G1. This command establishes an actuation data path and must not run alongside another source relay:
 
-Then start the PICO manager with every safety-sensitive value explicit:
+```bash
+cd /home/unitree/lsy/md_wla_deploy
+runtime/hand/venv/bin/python -I -B tools/md_wla_hand_source.py \
+  --source glove \
+  --input-endpoint tcp://192.168.123.79:5560
+```
+
+Start SONIC on AGX with Dex3 disabled:
+
+```bash
+(cd gear_sonic_deploy && \
+  ./deploy.sh --input-type zmq_manager --output-type all --hand-mode external real)
+```
+
+Then start the PICO manager on AGX:
 
 ```bash
 python gear_sonic/scripts/pico_manager_thread_server.py \
   --manager \
   --input-source xrt \
-  --revo2-profile /absolute/path/to/validated-revo2-profile.json \
-  --revo2-command-bind tcp://0.0.0.0:<verified-command-port> \
-  --revo2-feedback-connect tcp://<robot-ip>:<verified-feedback-port> \
-  --revo2-controller-id <controller-id-configured-in-agent> \
+  --revo2-profile /mnt/data/lsy/GROOT-WholeBodyControl/gear_sonic/config/revo2/mondo_g1_6514_pico_pose_profile.v1.json \
+  --revo2-command-bind tcp://192.168.123.79:5560 \
+  --revo2-feedback-connect tcp://192.168.123.164:5561 \
   --permit-revo2-actuation
 ```
 
-`--permit-revo2-actuation` is mandatory and has no default. Supplying only part of the Revo2 configuration fails at startup. The legacy non-manager PICO path does not accept Revo2 actuation.
+`--permit-revo2-actuation` has no default. A partial Revo2 configuration fails at startup. Endpoints require explicit non-wildcard IPv4 addresses. The legacy non-manager PICO path does not accept hand actuation.
 
-Revo2 actuation currently requires `--input-source xrt`. Isaac Teleop 1.4 DeviceIO exposes controller values but not controller-origin sample timestamps, so it cannot prove that a repeated trigger record is fresh; combining `--input-source isaac-teleop` with any Revo2 option therefore fails closed at startup.
+Revo2 requires `--input-source xrt`: Isaac Teleop 1.4 DeviceIO does not expose controller-origin sample timestamps, so it cannot prove a repeated trigger record is fresh.
 
-The command publisher binds locally; the physical agent connects to it. The physical agent binds its feedback publisher; the PICO sender connects to that endpoint. Substitute the endpoints from the verified robot launcher rather than copying historical addresses.
+## GROOT operator gates and stopping
 
-## Runtime interlocks
+The unified executor has no BODY interlock. GROOT nevertheless retains explicit operator-level combined behavior:
 
-The hand sender only renews the receiver lease when all of these conditions hold:
+- manager `OFF` and `POSE_PAUSE` send a hand `stop` and clear the local target;
+- leaving either state requires a new fresh trigger timestamp and trigger release;
+- A+B+X+Y entering `OFF` requests hand stop and BODY stop through their separate paths;
+- stale PICO trigger input stops only the hand path;
+- BODY heartbeat loss, BODY fault, and the deployment terminal `O` key do not implicitly stop or authorize the hand;
+- process shutdown best-effort stops the hand sender but does not stop the persistent executor.
 
-- the manager is in an active streaming mode, not `OFF` or `POSE_PAUSE`;
-- a fresh C++ `sonic_control_status` heartbeat explicitly reports that SONIC is in `CONTROL`, uses `external` hand mode, and is not stopping;
-- the independently sampled dual-trigger timestamp advanced, and the local trigger sample is no older than 150 ms;
-- physical-agent feedback is fresh and matches the current session;
-- an `arm` command for the current session has been acknowledged before `enable`;
-- both triggers were released below `0.05` after startup or any stop.
+The A+B+X+Y combination is an application-level pair of stop requests, not an executor BODY interlock or a physical emergency-stop confirmation. The 200 ms lease starts when the executor receives/processes a valid command; it is not an end-to-end command age and does not prove that hardware physically stopped within 200 ms.
 
-Repeated trigger timestamps do not renew the hand lease. A trigger stream that becomes older than 150 ms, timestamp rollback, malformed/replayed agent feedback, agent restart, mode rejection, and feedback timeout latch the hand path off for the remainder of the manager process. Body tracking cannot substitute its timestamp for stale controller values. These hand faults do not stop the body loop.
+End a session in this order: request GROOT OFF, let the manager stop/exit, stop the session-owned glove relay, and leave the persistent executor running. Relay shutdown provides another best-effort stop barrier and does not close USB.
 
-A manager stop, `POSE_PAUSE`, local C++ emergency stop, stale C++ status, exception, or process shutdown sends best-effort `stop` and stops renewing the lease. Shutdown also sends best-effort `disarm`. Stop/disarm deliberately does **not** command the open pose, which avoids automatically dropping a grasped object. The physical agent's local lease timeout remains the final receiver-side loss-of-sender protection.
+## Offline validation
 
-## Validation sequence
-
-Before moving hardware:
+Before any hardware operation, run:
 
 ```bash
 python -m pytest gear_sonic/tests/test_revo2_hand_sender.py -q
 ```
 
-For staged hardware acceptance:
+The fake-only tests cover the pinned profile, exact relay command fields, direct enable, duplicate and rollback handling, one-shot expiry stop, queue saturation, unified feedback capabilities, relay-session feedback, and manager decoupling from BODY permission.
 
-1. Run the physical agent in identity/feedback-only checks and verify both sides.
-2. Start SONIC in `external` hand mode and verify no Dex3 command topics are created or written.
-3. Start the PICO manager with actuation disabled and verify body teleoperation plus the `sonic_control_status` heartbeat.
-4. Enable the Revo2 sender with reduced, approved close endpoints.
-5. Release both triggers, arm one hand in a clear workspace, and test small trigger travel.
-6. Repeat for the other hand, then test both hands.
-7. Verify PICO OFF, `POSE_PAUSE`, local C++ emergency stop, PICO disconnect, hand-agent disconnect, and network interruption all stop lease renewal and do not replay an old target after recovery.
-
-Code and mock tests alone do not constitute hardware acceptance.
+Code and mock tests do not constitute deployment, action validation, physical stop validation, or hardware acceptance.
